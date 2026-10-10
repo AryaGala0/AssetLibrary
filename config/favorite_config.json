@@ -1,0 +1,46 @@
+{
+    "Asset": [
+        {
+            "path": "F:/MProj/Assets/Maya/CHA_Hum_F_Face_13_retopo",
+            "name": "Fdrive_13_retopo"
+        },
+        {
+            "path": "Z:/MPJ_Maya/Face/Rig/CHA_Hum_F_Face_13_retopo",
+            "name": "Zdrive_13_retopo"
+        },
+        {
+            "path": "F:/MProj/Assets/Maya/CHA_Hum_F_Face_13_retopo/2026_9_28",
+            "name": "2026_9_28"
+        },
+        {
+            "path": "Z:/3D\u89d2\u8272/\u5185\u90e8\u5f52\u6863/\u626b\u63cf\u6a21\u578b",
+            "name": "\u626b\u63cf\u6a21\u578b"
+        },
+        {
+            "path": "E:/Personal/code/download",
+            "name": "download"
+        }
+    ],
+    "Code": [
+        {
+            "path": "E:/Personal/code/work",
+            "name": "work"
+        },
+        {
+            "path": "E:/Personal/code/work/OG",
+            "name": "OG"
+        },
+        {
+            "path": "E:/Personal/code/work/PT",
+            "name": "PT"
+        },
+        {
+            "path": "E:/Personal/code/work/MProj",
+            "name": "MProj"
+        },
+        {
+            "path": "E:/Personal/code/Arya_code/face_rig_help_tools",
+            "name": "face_rig_help_tools"
+        }
+    ]
+}

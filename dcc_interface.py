@@ -106,6 +106,64 @@ def _maya_capture_thumbnail(out_path, width, height):
 
 
 # ---------------------------------------------------------------------------
+# 发布后处理（Maya）：打开已发布的 face rig，设置 dna / 贴图属性并按 face 类型重排大纲
+# ---------------------------------------------------------------------------
+# (属性名, 字符串值)：均为相对发布根目录的路径，直接写进场景属性
+POST_PUBLISH_FACE_RIG_ATTRS = (
+    ("head_RL.dnaFilePath", "dna/head_behavior.dna"),
+    ("baseMapFile_head_color.fileTextureName", "Maps/color.jpg"),
+    ("baseMapFile_head_normal.fileTextureName", "Maps/normal.jpg"),
+    ("mapFile_head_wm1_normal.fileTextureName", "Maps/wm1.jpg"),
+    ("mapFile_head_wm2_normal.fileTextureName", "Maps/wm2.jpg"),
+    ("mapFile_head_wm3_normal.fileTextureName", "Maps/wm3.jpg"),
+    ("mapFile_head_cm1_color.fileTextureName", "Maps/cm1.jpg"),
+    ("mapFile_head_cm2_color.fileTextureName", "Maps/cm2.jpg"),
+    ("mapFile_head_cm3_color.fileTextureName", "Maps/cm3.jpg"),
+)
+
+# lsr.maya.rig.utils.patch_rig_root_groups 的参数
+POST_PUBLISH_FACE_RIG_ROOT_GROUPS = {
+    "root_bone": "Root",
+    "meshes": ["head_lod0_grp"],
+    "rig_type": "face",
+}
+
+
+def _maya_setup_published_face_rig(path, project_dir=None):
+    import maya.cmds as cmds
+    # 复制过来时可能带着只读权限（共享盘），保存前先补上写权限
+    try:
+        import stat
+        if not os.access(path, os.W_OK):
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+    except Exception:
+        pass
+    # 先切工程目录：属性里写的是 dna/... 与 Maps/... 这类相对路径，必须以发布根目录为工程
+    if project_dir:
+        cmds.workspace(project_dir.replace("\\", "/"), openWorkspace=True)
+    # Maya 的命令对反斜杠敏感，统一成 /，避免 Windows 路径被当转义符
+    scene_path = path.replace("\\", "/")
+    cmds.file(scene_path, open=True, force=True)
+
+    missing = []
+    for attr, value in POST_PUBLISH_FACE_RIG_ATTRS:
+        # 资产里缺某个节点/属性时跳过，不中断整条发布流程
+        if not cmds.objExists(attr):
+            missing.append(attr)
+            continue
+        cmds.setAttr(attr, value, type="string")
+
+    import lsr.maya.rig.utils as util
+    util.patch_rig_root_groups(
+        root_bone=POST_PUBLISH_FACE_RIG_ROOT_GROUPS["root_bone"],
+        meshes=list(POST_PUBLISH_FACE_RIG_ROOT_GROUPS["meshes"]),
+        rig_type=POST_PUBLISH_FACE_RIG_ROOT_GROUPS["rig_type"])
+
+    cmds.file(save=True, force=True)
+    return missing
+
+
+# ---------------------------------------------------------------------------
 # 3ds Max
 # ---------------------------------------------------------------------------
 def _get_max_main_window():
@@ -286,6 +344,23 @@ def run_script(path):
 def can_capture_thumbnail():
     """当前环境是否支持从视口生成缩略图（standalone 不支持）。"""
     return _DCC in _CAPTURE_THUMBNAIL
+
+
+def can_setup_published_face_rig():
+    """当前环境能否做发布后处理（打开 face rig、设属性、重排大纲）。"""
+    return _DCC == "maya"
+
+
+def setup_published_face_rig(path, project_dir=None):
+    """发布后处理：先把工程目录切到 project_dir（发布根目录），再在 Maya 中打开 path，
+    写入 dna / 贴图属性，按 face 类型重排大纲根组，然后保存。
+
+    返回缺失（不存在）的属性名列表；非 Maya 环境抛 RuntimeError。
+    """
+    if not can_setup_published_face_rig():
+        raise RuntimeError(
+            "Setting up the published face rig is only supported in Maya.")
+    return _maya_setup_published_face_rig(path, project_dir)
 
 
 def capture_thumbnail(out_path, width=256, height=256):

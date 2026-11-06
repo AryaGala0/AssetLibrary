@@ -27,6 +27,59 @@ ROLE_PATH = QtCore.Qt.UserRole          # 收藏项对应的目录路径
 ROLE_FOLDER = QtCore.Qt.UserRole + 1    # 收藏文件夹的名字（用于定位文件夹节点）
 ROLE_TYPE = QtCore.Qt.UserRole + 2      # 节点类型："category" / "folder" / "entry"
 
+# 发布（Publish）规则：(源相对路径, 目标相对路径)，均相对"资产目录 / 发布目录"
+#   源是目录 -> 递归复制其下所有文件到目标目录（保持子目录结构）
+#   源是文件 -> 复制成目标文件（可顺便改名，如 rig.ma -> face_rig.ma）
+PUBLISH_RULES = (
+    ("dna", "dna"),
+    ("fbx", "scenes/rig/Referenced/fbx"),
+    ("scenes/anim.ma", "scenes/rig/Referenced/face_rig.ma"),
+    ("SourceAssets", "Maps"),
+)
+
+# 发布后处理：复制完成后在 Maya 中打开这个已发布的文件，设置 dna / 贴图属性并重排大纲后保存
+POST_PUBLISH_FACE_RIG = "scenes/rig/Referenced/face_rig.ma"
+
+
+def collect_publish_tasks(src_root, dst_root, rules=PUBLISH_RULES):
+    """按 PUBLISH_RULES 展开出 (源文件, 目标文件) 列表。
+
+    返回 (tasks, missing)：missing 是源里不存在的规则项（相对路径字符串列表），
+    缺了不报错，只跳过并在发布结果里提示。
+    """
+    tasks = []
+    missing = []
+    for rel_src, rel_dst in rules:
+        src = os.path.join(src_root, *rel_src.split("/"))
+        dst = os.path.join(dst_root, *rel_dst.split("/"))
+        if not os.path.exists(src):
+            missing.append(rel_src)
+            continue
+        if os.path.isdir(src):
+            for dir_path, _, file_names in os.walk(src):
+                for file_name in file_names:
+                    file_path = os.path.join(dir_path, file_name)
+                    rel = os.path.relpath(file_path, src)
+                    tasks.append((file_path, os.path.join(dst, rel)))
+        else:
+            tasks.append((src, dst))
+    return tasks, missing
+
+
+def describe_publish_tasks(src_root, rules=PUBLISH_RULES):
+    """给发布对话框用的规则预览行：源 -> 目标（目录附带文件数 / 缺失标记）"""
+    lines = []
+    for rel_src, rel_dst in rules:
+        src = os.path.join(src_root, *rel_src.split("/"))
+        if not os.path.exists(src):
+            lines.append("{}  ->  {}    [missing]".format(rel_src, rel_dst))
+        elif os.path.isdir(src):
+            file_count = sum(len(files) for _, _, files in os.walk(src))
+            lines.append("{}/  ->  {}/    [{} files]".format(rel_src, rel_dst, file_count))
+        else:
+            lines.append("{}  ->  {}".format(rel_src, rel_dst))
+    return lines
+
 
 class FavoriteTreeWidget(QtWidgets.QTreeWidget):
     """收藏树控件：支持把收藏项拖拽到文件夹/分类上完成归类。
@@ -85,6 +138,8 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
         self._favorite_loading = False
         # 资产目录树右键复制的源路径（内部剪贴板）
         self._dir_clipboard_path = ""
+        # 上一次选择的发布路径（Publish 对话框默认带出）
+        self.last_publish_path = ""
         # 缩略图异步加载器（initUI 里创建）与回调用的 key->卡片 映射
         self.thumb_loader = None
         self._thumb_targets = {}
@@ -223,6 +278,10 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
 
         # root path
         self.main_widget.root_path_le.setReadOnly(True)
+        # 路径栏右键菜单：保留默认的复制/全选，并追加"在资源管理器中打开"
+        self.main_widget.root_path_le.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.main_widget.root_path_le.customContextMenuRequested.connect(
+            self.show_root_path_menu)
         self.main_widget.root_path_btn.clicked.connect(self.set_root_path)
 
         # code panel
@@ -893,6 +952,25 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
             return
         self.default_path = new_path
         self.populate_tree_view_ui()
+
+    def show_root_path_menu(self, pos):
+        """Directory 路径栏右键菜单：在系统文件管理器中打开当前目录。
+
+        在 QLineEdit 默认菜单（复制 / 全选等）后追加 "Open in Explorer"，
+        这样右键路径栏既能复制路径，也能直接打开所在文件夹。
+        """
+        line_edit = self.main_widget.root_path_le
+        menu = line_edit.createStandardContextMenu()
+        menu.setStyleSheet(utils.AssetButton.menu_qss_stylesheet)
+        menu.setStyle(utils.MenuCustomStyle())
+        menu.addSeparator()
+
+        path = self.default_path
+        open_action = menu.addAction(
+            "Open in Explorer", partial(utils.open_folder_of_given_path, path))
+        # 当前路径已失效时置灰，避免打开失败
+        open_action.setEnabled(bool(path) and os.path.isdir(path))
+        menu.exec_(line_edit.mapToGlobal(pos))
 
     def enter_directory(self, path):
         """进入指定子目录（文件夹卡片双击时调用）。"""
@@ -1570,6 +1648,10 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
             explorer_path = path if os.path.isdir(path) else os.path.dirname(path)
             menu.addAction("Open in Explorer",
                            partial(utils.open_folder_of_given_path, explorer_path))
+            if os.path.isdir(path):
+                # 右键目录才能发布：把目录内容按发布规则复制到指定发布路径
+                menu.addSeparator()
+                menu.addAction("Publish", partial(self.publish_asset_folder, path))
         else:
             # 空白处右键：粘贴到当前根目录
             paste_action = menu.addAction("Paste", partial(self.paste_directory_item, None))
@@ -1659,6 +1741,128 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
             if not os.path.exists(candidate):
                 return candidate
             i += 1
+
+    def publish_asset_folder(self, src_path=None):
+        """右键文件夹 -> Publish：选择发布路径，二次确认后按 PUBLISH_RULES 复制文件。
+
+        供资产卡片（文件夹）与左侧目录树共用。
+        """
+        if not src_path or not os.path.isdir(src_path):
+            QtWidgets.QMessageBox.warning(
+                self, "Publish", "Please right click a folder to publish.")
+            return
+        src_path = os.path.normpath(src_path)
+
+        dialog = Publish_Dialog(self, src_path)
+        if not dialog.exec_():
+            return
+        dst_root = dialog.publish_path
+        self.last_publish_path = dst_root
+
+        tasks, missing = collect_publish_tasks(src_path, dst_root)
+        if not tasks:
+            QtWidgets.QMessageBox.warning(
+                self, "Publish",
+                "Nothing to publish in:\n{}\n\nNo rule matched any existing file.".format(src_path))
+            return
+
+        # 二次确认：发布路径存在同名文件时会被覆盖
+        detail = "\n".join(describe_publish_tasks(src_path))
+        # 本次发布会产出 face rig 时，提前说明随后会在 Maya 里打开它（当前场景会被替换）
+        face_rig_path = os.path.join(dst_root, *POST_PUBLISH_FACE_RIG.split("/"))
+        face_rig_in_tasks = any(
+            os.path.normcase(dst) == os.path.normcase(face_rig_path) for _, dst in tasks)
+        post_note = ""
+        if face_rig_in_tasks and dcc_interface.can_setup_published_face_rig():
+            post_note = ("\n\nAfter copying, the project will be set to the publish folder, "
+                         "then {} will be opened in Maya\nto set the dna / texture attributes "
+                         "and rebuild the rig outliner, then saved.\n"
+                         "The current scene will be replaced.".format(
+                             POST_PUBLISH_FACE_RIG))
+        answer = QtWidgets.QMessageBox.question(
+            self, "Publish",
+            "Publish\n    {}\nto\n    {}\n\n"
+            "{} file(s) will be copied (existing files will be overwritten).\n\n{}{}\n\nContinue?".format(
+                src_path, dst_root, len(tasks), detail, post_note),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+
+        done, failed = self._copy_publish_tasks(tasks)
+        post_ok, post_message = self._post_publish_face_rig(dst_root)
+
+        message = "Published {} file(s) to:\n{}".format(done, dst_root)
+        if missing:
+            message += "\n\nSkipped (not found in source):\n{}".format(
+                "\n".join(missing))
+        if post_message:
+            message += "\n\n" + post_message
+        if failed:
+            QtWidgets.QMessageBox.warning(
+                self, "Publish",
+                "{}\n\nFailed {} file(s):\n{}".format(
+                    message, len(failed), "\n".join(failed[:10])))
+        elif post_message and not post_ok:
+            QtWidgets.QMessageBox.warning(self, "Publish", message)
+        else:
+            QtWidgets.QMessageBox.information(self, "Publish", message)
+        self.populate_asset_in_display_widget()
+
+    def _post_publish_face_rig(self, dst_root):
+        """发布后处理：先把工程目录切到发布根目录，再在 Maya 中打开已发布的 face rig，
+        设置属性并重排大纲后保存。
+
+        返回 (是否成功执行, 提示信息)；文件不存在时返回 (False, "")。
+        非 Maya 环境只给提示，不影响已完成的复制。
+        """
+        face_rig = os.path.join(dst_root, *POST_PUBLISH_FACE_RIG.split("/"))
+        if not os.path.exists(face_rig):
+            return False, ""
+        if not dcc_interface.can_setup_published_face_rig():
+            return False, ("Post process skipped (needs Maya):\n{}".format(
+                POST_PUBLISH_FACE_RIG))
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            missing_attrs = dcc_interface.setup_published_face_rig(face_rig, dst_root)
+        except Exception as e:
+            return False, "Post process failed on:\n{}\n{}".format(face_rig, e)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        text = ("Post process done (project set to {}, attributes set, "
+                "outliner rebuilt, file saved):\n{}".format(dst_root, face_rig))
+        if missing_attrs:
+            text += "\n\nMissing attributes (skipped):\n{}".format(
+                "\n".join(missing_attrs))
+        return True, text
+
+    def _copy_publish_tasks(self, tasks):
+        """按 (源, 目标) 列表逐个复制，带进度条；返回 (成功数, 失败信息列表)。"""
+        progress = QtWidgets.QProgressDialog(
+            "Publishing files...", "Cancel", 0, len(tasks), self)
+        progress.setWindowTitle("Publish")
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        done = 0
+        failed = []
+        for i, (src, dst) in enumerate(tasks):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            progress.setLabelText("Copying:\n{}".format(os.path.basename(src)))
+            QtWidgets.QApplication.processEvents()
+            try:
+                dst_dir = os.path.dirname(dst)
+                if dst_dir and not os.path.isdir(dst_dir):
+                    os.makedirs(dst_dir)
+                shutil.copy2(src, dst)
+                done += 1
+            except Exception as e:
+                failed.append("{} -> {}\n{}".format(src, dst, e))
+        progress.setValue(len(tasks))
+        return done, failed
 
     def get_input_dialog(self):
         dialog = QtWidgets.QDialog(self)
@@ -1763,6 +1967,107 @@ class AssetLibrary_Win(QtWidgets.QMainWindow):
         # 代码界面下，"+" 按钮用于新建 py 文件
         if self.main_widget.code_view_btn.isChecked():
             self.main_widget.code_panel.add_py_file()
+
+
+class Publish_Dialog(QtWidgets.QDialog):
+    """选择发布路径的对话框：源目录只读，目标目录可浏览选择，并预览将要复制的文件。
+
+    exec_() 返回 Accepted 后，publish_path 即用户选择的发布根目录。
+    """
+
+    def __init__(self, parent, src_path):
+        super(Publish_Dialog, self).__init__(parent)
+        self.parent = parent
+        self.src_path = os.path.normpath(src_path)
+        self.publish_path = ""
+        self.setObjectName("Dialog")
+        self.setWindowTitle("Publish")
+        self.setModal(QtCore.Qt.ApplicationModal)
+        self.resize(700, 460)
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(10)
+
+        form_layout = QtWidgets.QFormLayout()
+        form_layout.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        src_le = QtWidgets.QLineEdit(self.src_path)
+        src_le.setObjectName("publish_src_le")
+        src_le.setReadOnly(True)
+        form_layout.addRow("Source:", src_le)
+
+        dst_layout = QtWidgets.QHBoxLayout()
+        self.dst_le = QtWidgets.QLineEdit()
+        self.dst_le.setObjectName("publish_dst_le")
+        self.dst_le.setPlaceholderText("Choose the folder to publish into")
+        if self.parent.last_publish_path:
+            self.dst_le.setText(self.parent.last_publish_path)
+        self.browse_btn = QtWidgets.QPushButton("Browse...")
+        self.browse_btn.setObjectName("publish_browse_btn")
+        self.browse_btn.setFixedWidth(90)
+        self.browse_btn.clicked.connect(self.browse_publish_path)
+        dst_layout.addWidget(self.dst_le)
+        dst_layout.addWidget(self.browse_btn)
+        form_layout.addRow("Publish To:", dst_layout)
+        main_layout.addLayout(form_layout)
+
+        main_layout.addWidget(QtWidgets.QLabel("Files to publish:"))
+        self.preview_list = QtWidgets.QListWidget()
+        self.preview_list.setObjectName("publish_preview_list")
+        self.preview_list.setStyleSheet('font: 10pt "Arial";')
+        for line in describe_publish_tasks(self.src_path):
+            self.preview_list.addItem(line)
+        main_layout.addWidget(self.preview_list, 1)
+
+        self.summary_label = QtWidgets.QLabel("")
+        self.summary_label.setObjectName("publish_summary_label")
+        main_layout.addWidget(self.summary_label)
+
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        self.button_box.setObjectName("publish_bb")
+        self.button_box.button(QtWidgets.QDialogButtonBox.Ok).setText("Publish")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        main_layout.addWidget(self.button_box)
+
+        self.dst_le.textChanged.connect(self.update_summary)
+        self.update_summary()
+
+    def browse_publish_path(self):
+        start = self.dst_le.text().strip() or os.path.dirname(self.src_path)
+        dst = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose the publish folder", start)
+        if dst:
+            self.dst_le.setText(os.path.normpath(dst))
+
+    def current_publish_path(self):
+        return os.path.normpath(self.dst_le.text().strip().strip('"'))
+
+    def update_summary(self):
+        """根据当前目标路径实时刷新"共多少文件 / 提示先选路径"。"""
+        dst = self.current_publish_path()
+        if not dst:
+            self.summary_label.setText("Please choose the publish folder.")
+            self.button_box.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(False)
+            return
+        self.button_box.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(True)
+        tasks, missing = collect_publish_tasks(self.src_path, dst)
+        text = "Total: {} file(s) will be copied to {}".format(len(tasks), dst)
+        if missing:
+            text += "\nSkipped (not found in source): {}".format(", ".join(missing))
+        self.summary_label.setText(text)
+
+    def accept(self):
+        self.publish_path = self.current_publish_path()
+        if not self.publish_path:
+            QtWidgets.QMessageBox.warning(
+                self, "Publish", "Please choose the publish folder.")
+            return
+        super(Publish_Dialog, self).accept()
 
 
 class Preference_Dialog(QtWidgets.QMainWindow):
@@ -2188,7 +2493,7 @@ def reload():
         import assetLibrary_app
         assetLibrary_app.reload()
     """
-    import asset_lib_utils.utils as _utils
+    import asset_lib_utils.utils as asset_uitls
     import asset_lib_utils.flowlayout as _flow
     import asset_lib_utils.code_panel as _code
     import dcc_interface as _dcc
@@ -2204,7 +2509,7 @@ def reload():
 
     # 按依赖顺序重新加载
     importlib.reload(_dcc)
-    importlib.reload(_utils)
+    importlib.reload(asset_uitls)
     importlib.reload(_flow)
     importlib.reload(_code)
     importlib.reload(_app)

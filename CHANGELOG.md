@@ -1,5 +1,71 @@
 # 更新日志 (Changelog)
 
+## 2026-11-02 Publish 增加发布后处理（Maya 打开 face_rig.ma 设属性 + 重排大纲 + 保存）
+
+### 1. dcc_interface.py
+
+- 新增发布后处理配置 `POST_PUBLISH_FACE_RIG_ATTRS`：`head_RL.dnaFilePath -> dna/head.dna`、`baseMapFile_head_color.fileTextureName -> Maps/color.jpg`、`baseMapFile_head_normal.fileTextureName -> Maps/normal.jpg`、`mapFile_head_wm1~wm3_normal.fileTextureName -> Maps/wm1~wm3.jpg`、`mapFile_head_cm1~cm3_color.fileTextureName -> Maps/cm1~cm3.jpg`（均为相对发布根目录的路径字符串）。
+- 新增 `POST_PUBLISH_FACE_RIG_ROOT_GROUPS = {"root_bone": "Root", "meshes": ["head_lod0_grp"], "rig_type": "face"}`，对应 `lsr.maya.rig.utils.patch_rig_root_groups` 的入参。
+- 新增 `_maya_setup_published_face_rig(path)`：`cmds.file(open=True, force=True)` 打开已发布文件 → 逐个 `cmds.setAttr(attr, value, type="string")`（属性不存在则跳过并记入返回值）→ `util.patch_rig_root_groups(**kwargs)` → `cmds.file(save=True, force=True)`。打开前若文件只读先补写权限，并把路径里的 `\` 换成 `/`。
+- 新增对外接口 `can_setup_published_face_rig()`（只有 Maya 返回 True）与 `setup_published_face_rig(path)`（非 Maya 抛 `RuntimeError`，返回缺失属性列表）。
+- 踩坑记录：`copy2` 会继承源文件的只读属性，共享盘资产发布会带着只读权限落到目标，`cmds.file(save=True)` 会直接报错，因此在打开前 `os.chmod` 补 `S_IWRITE`；Maya 命令对反斜杠敏感，Windows 路径统一转成正斜杠再传给 `cmds.file`。
+- 踩坑记录：DCC 专属 import 必须留在本文件（其余模块不得 import DCC），所以 attrs 表与 patch 调用都放在 `dcc_interface.py`，`assetLibrary_app.py` 只调用两个对外函数。
+
+### 2. assetLibrary_app.py
+
+- 新增常量 `POST_PUBLISH_FACE_RIG = "scenes/rig/Referenced/face_rig.ma"`。
+- `publish_asset_folder`：二次确认框里当本次任务包含该 face rig 且当前是 Maya 时追加提示——复制后会在 Maya 中打开该文件（当前场景会被替换）并设置属性/重排大纲后保存。
+- 复制完成后调用新增的 `_post_publish_face_rig(dst_root)`，把结果并入发布结果弹窗：成功走 information，失败/非 Maya 环境走 warning，不阻断已完成的复制。
+- 新增 `_post_publish_face_rig(dst_root)`：目标文件不存在则静默跳过；非 Maya 返回跳过提示；执行时 `setOverrideCursor(WaitCursor)` 防误操作；成功时汇报目标路径与被跳过的缺失属性。
+- 踩坑记录：属性缺失（如资产只给了部分贴图节点）用跳过而非抛错，否则一个小资产缺节点就整条发布流程失败；缺失项集中汇报，避免"以为设上了"。
+
+### 3. 补充：发布后处理前先切工程目录
+
+- `dcc_interface.py`：`_maya_setup_published_face_rig(path, project_dir=None)` 在 `cmds.file(open=...)` 之前先 `cmds.workspace(project_dir, openWorkspace=True)`；`setup_published_face_rig(path, project_dir=None)` 透传该参数。
+- `assetLibrary_app.py`：`_post_publish_face_rig(dst_root)` 调用时传入 `dst_root`，成功提示里带上工程目录；发布确认框的提示文案同步改为"先把工程切到发布目录，再打开 face rig"。
+- 原因：属性值是 `dna/head.dna`、`Maps/color.jpg` 这类相对路径，必须落在发布的工程根目录下才有意义；先切 workspace 再打开场景，Maya 才不会按旧工程解析这些相对路径。
+- 细节：workspace 与场景路径都先 `replace("\\", "/")`，避免 Windows 反斜杠被 Maya 当转义符。
+
+## 2026-11-02 右键文件夹新增 Publish（选择发布路径 + 二次确认 + 按规则复制）
+
+### 1. assetLibrary_app.py
+
+- 新增模块级发布规则 `PUBLISH_RULES = (("dna", "dna"), ("fbx", "scenes/rig/Referenced/fbx"), ("scenes/rig.ma", "scenes/rig/Referenced/fbx/face_rig.ma"), ("SourceAssets", "Maps"))`：(源相对路径, 目标相对路径)，源是目录则递归复制其下所有文件到目标目录，源是文件则复制成目标文件（可顺便改名，如 `rig.ma -> face_rig.ma`）。
+- 新增 `collect_publish_tasks(src_root, dst_root, rules=PUBLISH_RULES)` / `describe_publish_tasks(src_root)`：前者展开出 `(源文件, 目标文件)` 列表并返回缺失的源规则项，后者生成对话框用的预览行（目录附文件数、缺失打 `[missing]`）。
+- 新增 `Publish_Dialog(QtWidgets.QDialog)`：源路径只读 + 目标路径 `QLineEdit` 与 `Browse...`（`QFileDialog.getExistingDirectory`）、规则预览 `QListWidget`、实时统计（总文件数 / 被跳过的缺失项）、OK 改名为 "Publish"；目标为空时 OK 置灰，`accept()` 里再兜底校验并把结果写到 `self.publish_path`。
+- 新增主窗口入口 `publish_asset_folder(src_path=None)`：非目录直接提示；对话框确认后展开任务，任务为空提示"No rule matched"；随后用 `QMessageBox.question` 做二次确认（列出源/目标路径、文件数、覆盖提醒、逐条规则明细）；复制完弹结果（成功数、被跳过的缺失项、失败前 10 条），最后刷新资产显示区。
+- 新增 `_copy_publish_tasks(tasks)`：`QProgressDialog` 逐个 `shutil.copy2`，先 `os.makedirs` 目标目录，可取消；失败不中断，收集错误信息后统一汇报。
+- 主窗口 `__init__` 增加 `self.last_publish_path`，发布对话框默认带出上次选择的发布路径。
+- `show_directory_menu` 中当右键项是目录时追加 `Publish` 项（文件不显示）。
+
+### 2. asset_lib_utils/utils.py
+
+- `AssetButton.create_menu` 的文件夹分支新增 `Publish` 菜单项，调用新增的 `AssetButton.publish_folder()`。
+- 新增 `AssetButton.publish_folder()`：沿用 `enter_folder` 的回主窗口模式，通过 `getattr(self.parent, "publish_asset_folder", None)` 调用主窗口逻辑（`AssetButton` 仍不 import 主窗口、不碰 Qt 文件对话框）。
+
+### 3. 踩坑记录
+
+- 规则中 `dna -> dna`、`fbx -> scenes/rig/Referenced/fbx`、`SourceAssets -> Maps` 三类其实都是"目录 -> 目录"，只有 `scenes/rig.ma` 是"文件 -> 文件"：因此没有设计成 tree / file 两种模式，改为统一按 `os.path.isdir(src)` 判断——目录递归复制（保持子目录结构），文件直接复制。少一个参数、少一处分支出错点。
+- 源目录中缺失的规则项（如没有 `dna`）不报错、不中断，只在预览与结果里列成 "Skipped (not found in source)"，避免一个资产不齐就发不了。
+- 目标文件已存在时按"发布"语义直接覆盖（`shutil.copy2`），确认框里已明确提示，未做 `_unique_dest_path` 式的改名，否则反复发布会堆出一堆 `_copy`。
+
+## 2026-10-28 Directory 路径栏右键菜单新增 "Open in Explorer"
+
+### 1. assetLibrary_app.py
+
+- `initUI` 中给顶部路径栏 `root_path_le` 设置 `Qt.CustomContextMenu`，并连接 `customContextMenuRequested` 到新增的 `show_root_path_menu`。
+- 新增 `show_root_path_menu(pos)`：先用 `QLineEdit.createStandardContextMenu()` 拿到默认菜单（复制 / 全选等），再追加分隔线与 `Open in Explorer`，调用 `utils.open_folder_of_given_path(self.default_path)` 在系统文件管理器打开当前目录；当前路径无效时该项置灰。
+- 踩坑记录：不要直接 `setContextMenuPolicy + 新建 QMenu` 整体替换默认菜单，否则只读路径栏原有的"复制/全选"会丢失；改为"标准菜单 + 追加自定义项"保留原功能。
+
+## 2026-10-13 修复旧版 `reload(utils)` 引起的 "spec not found" 报错（AssetLibrary 旧目录）
+
+### 1. AssetLibrary/source/assetLibrary_app.py（旧版本，非本工作区）
+
+- 现象：在 Maya 里运行旧目录脚本报 `ModuleNotFoundError: spec not found for the module 'assetlib_utils'`，栈顶为 `assetLibrary_app.py` 的 `reload(utils)` 一行。
+- 根因：`utils` 是用 `importlib.util.spec_from_file_location("assetlib_utils", ...)` 手动加载并写入 `sys.modules` 的模块，但名字 `assetlib_utils` 并不在 `sys.path` 上；`importlib.reload()` 会按模块名重新调用 `_find_spec` 去找 spec，找不到就抛出该错。且 `_load_local_module` 每次都会 `exec_module`，模块本就是全新的，这次 `reload` 纯属多余。
+- 修复：去掉 `from imp import reload` 与 `reload(utils)`（随手清掉同样未使用的 `from pprint import pprint`），改为注释说明，防止以后又加回来。
+- 勘误：2026-10-09 条目中“`reload(utils)` 仍可用”的说法不成立，特此更正——手动 spec 加载的模块无法被 `importlib.reload` 按名字重新定位。
+
 ## 2026-10-10 收藏栏支持“收藏文件夹”分类（新建 / 归类 / 拖拽）
 
 按需求实现收藏栏的文件夹分组功能，约定：只支持一层（分类 → 文件夹 → 收藏项）、添加收藏时放进当前选中的文件夹、用拖拽把已有收藏归类。

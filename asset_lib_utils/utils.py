@@ -491,6 +491,12 @@ class AssetButton(QtWidgets.QWidget):
         if enter is not None and self.asset_path:
             enter(self.asset_path)
 
+    def publish_folder(self):
+        """右键文件夹卡片 -> Publish：交回主窗口发布（选路径 + 二次确认 + 复制）。"""
+        publish = getattr(self.parent, "publish_asset_folder", None)
+        if publish is not None and self.asset_path:
+            publish(self.asset_path)
+
     def run_exe(self):
         """运行 exe 文件"""
         if not self.asset_path or not os.path.exists(self.asset_path):
@@ -662,6 +668,9 @@ class AssetButton(QtWidgets.QWidget):
             menu.addAction("Open", self.enter_folder)
             menu.addAction("Open in Explorer",
                            partial(open_folder_of_given_path, self.asset_path))
+            menu.addSeparator()
+            # 把该资产文件夹按发布规则复制到指定的发布路径
+            menu.addAction("Publish", self.publish_folder)
             menu.addSeparator()
             menu.addAction("Set Preview Image", self.set_preview_image)
             # 用当前 DCC 视口拍屏作为文件夹封面
